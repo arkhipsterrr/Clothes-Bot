@@ -10,7 +10,7 @@ import asyncpg
 from datetime import datetime
 
 # === НАСТРОЙКИ ===
-BOT_TOKEN = os.getenv("8497182676:AAEGi64U491MEF60VGMJBM86IAN5PGuGlAY")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_IDS = [1453081434]  # Заменить на свой ID
 
 PAYMENT_DETAILS = (
