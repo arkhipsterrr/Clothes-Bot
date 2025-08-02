@@ -1,2 +1,3 @@
-aiogram==3.11.0
+aiogram
 asyncpg
+python-dotenv
