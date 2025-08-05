@@ -133,10 +133,6 @@ class MakeContribution(StatesGroup):
 class EditContribution(StatesGroup):
     waiting_new_amount = State()
 
-class MakeContribution(StatesGroup):
-    waiting_amount = State()  # Ожидание ввода суммы вклада
-    waiting_confirmation = State()  # Ожидание подтверждения вклада
-
 # === БОТ ===
 bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
@@ -1311,92 +1307,11 @@ async def admin_panel(call: CallbackQuery):
 # === Make Contribution (User) ===
 @dp.callback_query(F.data == "make_contribution")
 async def make_contribution_start(call: CallbackQuery, state: FSMContext):
-    await state.set_state(MakeContribution.waiting_amount)
-    # Отправляем ссылку и QR-код
-    await bot.send_message(
-        chat_id=call.message.chat.id,
-        text="💳 Для внесения вклада перейдите по ссылке или сканируйте QR-код:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Перейти к оплате", url="https://tbank.ru/cf/3oUes0JHure")],
-        ])
-    )
-    # Отправляем QR-код
-    await bot.send_photo(
-        chat_id=call.message.chat.id,
-        photo=FSInputFile("path_to_qr_code_image.png"),  # Путь к файлу QR-кода
-        caption="📱 Сканируйте этот QR-код для оплаты."
-    )
-    # Запрашиваем сумму вклада
+    await state.set_state(MakeContribution.waiting_bank)
     await call.message.answer(
-        "💰 Введите сумму вашего вклада (в рублях):",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_contribution")]
-        ])
+        "🏦 Введите название вашего банка (например, Сбербанк, Тинькофф):"
     )
 
-@dp.message(MakeContribution.waiting_amount)
-async def process_contribution_amount(message: Message, state: FSMContext):
-    try:
-        amount = float(message.text)
-        if amount <= 0:
-            raise ValueError
-    except ValueError:
-        await message.answer("Неверный формат суммы. Введите положительное число.")
-        return
-
-    # Сохраняем сумму вклада в состоянии
-    await state.update_data(amount=amount)
-
-    # Создаем кнопку подтверждения
-    markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Подтвердить вклад", callback_data="confirm_contribution")],
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_contribution")]
-    ])
-
-    # Отправляем подтверждение
-    await message.answer(
-        f"Вы хотите сделать вклад на сумму <b>{amount}₽</b>. Подтвердите оплату.",
-        reply_markup=markup,
-        parse_mode="HTML"
-    )
-
-@dp.callback_query(MakeContribution.waiting_amount, F.data == "confirm_contribution")
-async def confirm_contribution(call: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    amount = data.get("amount")
-
-    if not amount:
-        await call.answer("Ошибка: сумма вклада не указана.", show_alert=True)
-        return
-
-    user_id = call.from_user.id
-    username = call.from_user.username
-
-    conn = await get_db_conn()
-    try:
-        # Получаем ID текущей активной поставки
-        supply_id = await get_latest_active_supply_id()
-        if not supply_id:
-            await call.answer("❌ Нет активной поставки.", show_alert=True)
-            return
-
-        # Добавляем вклад в базу данных
-        await conn.execute(
-            "INSERT INTO contributions (user_id, supply_id, amount, username) VALUES ($1, $2, $3, $4)",
-            user_id, supply_id, amount, username
-        )
-    finally:
-        await conn.close()
-
-    await state.clear()
-    await call.answer(f"✅ Ваш вклад на сумму {amount}₽ успешно зарегистрирован.", show_alert=True)
-    await cmd_start(call.message)  # Возвращаем пользователя в главное меню
-
-@dp.callback_query(MakeContribution.waiting_amount, F.data == "cancel_contribution")
-async def cancel_contribution(call: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await call.answer("❌ Вклад отменен.", show_alert=True)
-    await cmd_start(call.message)  # Возвращаем пользователя в главное меню
 @dp.message(MakeContribution.waiting_bank)
 async def process_user_bank(message: Message, state: FSMContext):
     await state.update_data(bank=message.text)
