@@ -6,15 +6,20 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-import asyncpg # Changed from sqlite3
+import asyncpg
 from datetime import datetime
-from dotenv import load_dotenv # For loading environment variables
+from dotenv import load_dotenv
 
-load_dotenv() # Load environment variables from .env file
+load_dotenv()
 
 # === НАСТРОЙКИ ===
-BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")  # Get from environment or default
-ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "1453081434").split(',')))  # Get from environment or default
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN is not set in environment variables")
+try:
+    ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "").split(',')))
+except (ValueError, TypeError):
+    ADMIN_IDS = []
 PAYMENT_DETAILS = (
     "💳 Реквизиты для вклада:\n"
     "Принимаю ТОЛЬКО Т-БАНК!!!\n"
@@ -25,7 +30,9 @@ PAYMENT_DETAILS = (
 
 # === ПАПКИ ===
 os.makedirs("photos", exist_ok=True)
-DATABASE_URL = os.getenv("DATABASE_URL") # Railway provides this env var
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL is not set in environment variables")
 
 # === БАЗА ДАННЫХ ===
 async def init_db():
@@ -52,8 +59,8 @@ async def init_db():
                 sell_price REAL,
                 description TEXT,
                 photo TEXT,
-                is_sold BOOLEAN DEFAULT FALSE, -- Changed from INTEGER to BOOLEAN
-                status TEXT DEFAULT 'Куплен', -- Added default for new column
+                is_sold BOOLEAN DEFAULT FALSE,
+                status TEXT DEFAULT 'Куплен',
                 FOREIGN KEY(supply_id) REFERENCES supplies(id) ON DELETE CASCADE
             )
         """)
@@ -75,12 +82,10 @@ async def init_db():
                 username TEXT,
                 bank TEXT,
                 payment_info TEXT,
-                status TEXT DEFAULT 'pending'  -- pending, approved, rejected
+                status TEXT DEFAULT 'pending'
             )
         """)
 
-        # === ДОБАВЛЯЕМ СТОЛБЕЦ status, ЕСЛИ ЕГО НЕТ ===
-        # Check if 'status' column exists in 'items' table
         column_exists = await conn.fetchval("""
             SELECT EXISTS (
                 SELECT 1
@@ -91,7 +96,6 @@ async def init_db():
         if not column_exists:
             await conn.execute("ALTER TABLE items ADD COLUMN status TEXT DEFAULT 'Куплен'")
 
-        # === Создаём тестовую поставку, если нет ===
         count = await conn.fetchval("SELECT COUNT(*) FROM supplies")
         if count == 0:
             await conn.execute("INSERT INTO supplies (name, status) VALUES ('Поставка #1', 'active')")
@@ -101,9 +105,6 @@ async def init_db():
     finally:
         if conn:
             await conn.close()
-
-# Call init_db in main async function
-# asyncio.run(init_db()) - this will be called in main()
 
 # === FSM для добавления товара ===
 class AddItem(StatesGroup):
@@ -164,7 +165,8 @@ async def get_supply_list_keyboard(supply_type):
         else:
             supplies = await conn.fetch("SELECT id, name FROM supplies WHERE status = 'completed'")
     finally:
-        await conn.close()
+        if conn:
+            await conn.close()
 
     buttons = []
     for s in supplies:
@@ -172,14 +174,14 @@ async def get_supply_list_keyboard(supply_type):
     buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-
 async def get_item_list_keyboard(supply_id, for_admin=False):
     conn = await get_db_conn()
     items = []
     try:
         items = await conn.fetch("SELECT id, title, price, is_sold FROM items WHERE supply_id = $1", supply_id)
     finally:
-        await conn.close()
+        if conn:
+            await conn.close()
 
     buttons = []
     for item in items:
@@ -189,7 +191,6 @@ async def get_item_list_keyboard(supply_id, for_admin=False):
         callback = f"admin_item_{item_id}" if for_admin else f"user_item_{item_id}"
         buttons.append([InlineKeyboardButton(text=text, callback_data=callback)])
 
-    # Кнопка "Назад"
     back_callback = "admin_view_supply" if for_admin else "view_supply"
     buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=back_callback)])
 
@@ -218,7 +219,8 @@ async def admin_view_requests(call: CallbackQuery):
     try:
         requests = await conn.fetch("SELECT id, user_id, username, bank, payment_info FROM contribution_requests WHERE status = 'pending'")
     finally:
-        await conn.close()
+        if conn:
+            await conn.close()
 
     if not requests:
         await call.answer("Нет новых заявок.", show_alert=True)
@@ -280,8 +282,8 @@ async def my_stats(call: CallbackQuery):
 
     conn = await get_db_conn()
     contrib_rows = []
+    top_rows = []
     try:
-        # === 1. Все вклады пользователя ===
         contrib_rows = await conn.fetch("""
             SELECT s.name, s.status, c.amount
             FROM contributions c
@@ -293,38 +295,31 @@ async def my_stats(call: CallbackQuery):
             await call.answer("Вы ещё не делали вкладов.", show_alert=True)
             return
 
-        # 1. Общая сумма вкладов
         total_invested = sum(row['amount'] for row in contrib_rows)
-
-        # 2. Прибыль от продаж (только завершённые поставки)
         total_profit = 0
         for row in contrib_rows:
             supply_name, status, amount = row['name'], row['status'], row['amount']
             if status == "completed":
-                profit = amount * 0.3  # 30% прибыли
+                profit = amount * 0.3
                 total_profit += profit
 
-        # 3. Самый большой вклад
         biggest_contrib = max(contrib_rows, key=lambda x: x['amount'])
         biggest_contrib_amount = biggest_contrib['amount']
         biggest_contrib_supply = biggest_contrib['name']
 
-        # 4. Количество поставок
         num_supplies = len(contrib_rows)
 
-        # 5. Самая удачная поставка (по коэффициенту прибыли)
         best_supply = None
         best_ratio = 0
         for row in contrib_rows:
             supply_name, status, amount = row['name'], row['status'], row['amount']
-            if status == "completed":
+            if status == "completed" and amount > 0:
                 profit = amount * 0.3
-                ratio = profit / amount  # можно умножить на 100 для %
+                ratio = profit / amount
                 if ratio > best_ratio:
                     best_ratio = ratio
                     best_supply = supply_name
 
-        # 6. Место в топе
         top_rows = await conn.fetch("""
             SELECT user_id, SUM(amount) as total
             FROM contributions
@@ -332,7 +327,8 @@ async def my_stats(call: CallbackQuery):
             ORDER BY total DESC
         """)
     finally:
-        await conn.close()
+        if conn:
+            await conn.close()
 
     my_total = total_invested
     my_rank = 1
@@ -341,9 +337,8 @@ async def my_stats(call: CallbackQuery):
             my_rank += 1
         else:
             break
-    my_rank -= 1  # исправляем смещение
+    my_rank -= 1
 
-    # === Формируем текст ===
     text = (
         "📊 <b>Ваша статистика</b>\n\n"
         f"💸 Всего вложено: <b>{total_invested}₽</b>\n"
@@ -354,7 +349,6 @@ async def my_stats(call: CallbackQuery):
         f"📦 Участвовал в поставках: <b>{num_supplies}</b>\n"
     )
 
-    # === Кнопка "Назад" ===
     markup = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")]
     ])
@@ -370,7 +364,8 @@ async def approve_contribution_request(call: CallbackQuery, state: FSMContext):
     try:
         row = await conn.fetchrow("SELECT user_id, bank, payment_info FROM contribution_requests WHERE id = $1", req_id)
     finally:
-        await conn.close()
+        if conn:
+            await conn.close()
 
     if not row:
         await call.answer("Заявка не найдена.")
@@ -378,9 +373,8 @@ async def approve_contribution_request(call: CallbackQuery, state: FSMContext):
 
     user_id, bank, info = row['user_id'], row['bank'], row['payment_info']
 
-    # Спрашиваем сумму
     await state.update_data(req_id=req_id, temp_user_id=user_id)
-    await state.set_state(MakeContribution.waiting_bank)  # Переиспользуем состояние
+    await state.set_state(MakeContribution.waiting_bank)
     await call.message.edit_text(f"Сколько внес пользователь (в рублях)?")
 
 @dp.message(MakeContribution.waiting_bank)
@@ -398,14 +392,12 @@ async def admin_enter_amount(message: Message, state: FSMContext):
 
     conn = await get_db_conn()
     try:
-        # Получаем последнюю активную поставку
         supply_id = await get_latest_active_supply_id()
         if not supply_id:
             await message.answer("❌ Нет активной поставки.")
             await state.clear()
             return
 
-        # Проверяем, есть ли уже вклад
         existing = await conn.fetchrow("SELECT amount FROM contributions WHERE user_id = $1 AND supply_id = $2", user_id, supply_id)
 
         async with conn.transaction():
@@ -414,15 +406,14 @@ async def admin_enter_amount(message: Message, state: FSMContext):
                 await conn.execute("UPDATE contributions SET amount = $1 WHERE user_id = $2 AND supply_id = $3",
                                     new_amount, user_id, supply_id)
             else:
-                await conn.execute("INSERT INTO contributions (user_id, supply_id, amount) VALUES ($1, $2, $3)",
-                                    user_id, supply_id, amount)
+                await conn.execute("INSERT INTO contributions (user_id, supply_id, amount, username) VALUES ($1, $2, $3, $4)",
+                                    user_id, supply_id, amount, message.from_user.username)
 
-            # Обновляем статус заявки
             await conn.execute("UPDATE contribution_requests SET status = 'approved' WHERE id = $1", req_id)
     finally:
-        await conn.close()
+        if conn:
+            await conn.close()
 
-    # Уведомляем пользователя
     try:
         await bot.send_message(
             user_id,
@@ -447,11 +438,9 @@ async def cmd_start(message: Message, state: FSMContext):
 
     conn = await get_db_conn()
     try:
-        # Получаем последнюю активную поставку
         supply_row = await conn.fetchrow("SELECT id FROM supplies WHERE status = 'active' ORDER BY id DESC LIMIT 1")
         supply_id = None
         if not supply_row:
-            # Если нет — создаём
             supply_id = await conn.fetchval(
                 "INSERT INTO supplies (name, status) VALUES ($1, 'active') RETURNING id",
                 f"Поставка от {datetime.now().strftime('%d.%m.%Y')}"
@@ -459,17 +448,16 @@ async def cmd_start(message: Message, state: FSMContext):
         else:
             supply_id = supply_row['id']
 
-        # Проверяем, есть ли уже вклад в ЭТОЙ поставке
         existing_contribution = await conn.fetchrow("SELECT 1 FROM contributions WHERE user_id = $1 AND supply_id = $2", user_id, supply_id)
         if not existing_contribution:
             await conn.execute("INSERT INTO contributions (user_id, supply_id, amount, username) VALUES ($1, $2, 0, $3)", user_id, supply_id, username)
         else:
             await conn.execute("UPDATE contributions SET username = $1 WHERE user_id = $2 AND supply_id = $3", username, user_id, supply_id)
     finally:
-        await conn.close()
+        if conn:
+            await conn.close()
 
     await message.answer("👋 Добро пожаловать! Выберите действие:", reply_markup=get_main_menu(user_id))
-
 
 async def get_latest_active_supply_id():
     conn = await get_db_conn()
@@ -477,7 +465,8 @@ async def get_latest_active_supply_id():
     try:
         row = await conn.fetchrow("SELECT id FROM supplies WHERE status = 'active' ORDER BY id DESC LIMIT 1")
     finally:
-        await conn.close()
+        if conn:
+            await conn.close()
     return row['id'] if row else None
 
 
@@ -501,7 +490,6 @@ async def user_show_item_details(call: CallbackQuery):
             row['title'], row['price'], row['sell_price'], row['description'], row['photo'], \
             row['is_sold'], row['supply_id'], row['status']
 
-        # === РАСЧЁТ ДОЛИ ВКЛАДА ===
         contrib_row = await conn.fetchrow("SELECT amount FROM contributions WHERE user_id = $1 AND supply_id = $2", user_id, supply_id)
         user_contribution = contrib_row['amount'] if contrib_row else 0
 
@@ -526,9 +514,9 @@ async def user_show_item_details(call: CallbackQuery):
                     deduction = 20.0 / N
                     share = max(share - deduction, 0)
     finally:
-        await conn.close()
+        if conn:
+            await conn.close()
 
-    # === СРОКИ ===
     arrival_text = "🚚 Приедет примерно: <b>20–30 дней</b>"
 
     if sell_price < 5000:
@@ -585,7 +573,8 @@ async def admin_create_supply(call: CallbackQuery):
     try:
         await conn.execute("INSERT INTO supplies (name, status) VALUES ($1, 'active')", name)
     finally:
-        await conn.close()
+        if conn:
+            await conn.close()
 
     await call.answer(f"✅ Поставка '{name}' создана!", show_alert=True)
     await admin_panel(call)
@@ -601,7 +590,8 @@ async def admin_delete_supply_start(call: CallbackQuery):
     try:
         supplies = await conn.fetch("SELECT id, name FROM supplies WHERE status = 'active'")
     finally:
-        await conn.close()
+        if conn:
+            await conn.close()
 
     if not supplies:
         await call.answer("Нет активных поставок.", show_alert=True)
@@ -614,7 +604,6 @@ async def admin_delete_supply_start(call: CallbackQuery):
 
     await call.message.answer("Выберите поставку для удаления:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
-
 @dp.callback_query(F.data.startswith("confirm_delete_supply_"))
 async def confirm_delete_supply(call: CallbackQuery):
     supply_id = int(call.data.split("_")[3])
@@ -624,7 +613,8 @@ async def confirm_delete_supply(call: CallbackQuery):
     try:
         name = await conn.fetchval("SELECT name FROM supplies WHERE id = $1", supply_id)
     finally:
-        await conn.close()
+        if conn:
+            await conn.close()
 
     if not name:
         await call.answer("Поставка не найдена.")
@@ -637,7 +627,6 @@ async def confirm_delete_supply(call: CallbackQuery):
     ])
     await call.message.edit_text(f"Что сделать с поставкой:\n\n<b>{name}</b>?", reply_markup=markup, parse_mode="HTML")
 
-
 @dp.callback_query(F.data.startswith("move_supply_"))
 async def move_supply_to_completed(call: CallbackQuery):
     supply_id = int(call.data.split("_")[2])
@@ -646,11 +635,11 @@ async def move_supply_to_completed(call: CallbackQuery):
     try:
         await conn.execute("UPDATE supplies SET status = 'completed' WHERE id = $1", supply_id)
     finally:
-        await conn.close()
+        if conn:
+            await conn.close()
 
     await call.answer("✅ Поставка перемещена в 'Предыдущие'.")
     await admin_panel(call)
-
 
 @dp.callback_query(F.data.startswith("full_delete_supply_"))
 async def full_delete_supply(call: CallbackQuery):
@@ -662,7 +651,8 @@ async def full_delete_supply(call: CallbackQuery):
             await conn.execute("DELETE FROM items WHERE supply_id = $1", supply_id)
             await conn.execute("DELETE FROM supplies WHERE id = $1", supply_id)
     finally:
-        await conn.close()
+        if conn:
+            await conn.close()
 
     await call.answer("✅ Поставка и все товары удалены.")
     await admin_panel(call)
@@ -681,7 +671,8 @@ async def admin_show_item_details(call: CallbackQuery, state: FSMContext):
             FROM items WHERE id = $1
         """, item_id)
     finally:
-        await conn.close()
+        if conn:
+            await conn.close()
 
     if not row:
         await call.answer("Товар не найден.")
@@ -744,7 +735,8 @@ async def my_contributions(call: CallbackQuery):
         contrib_rows = await conn.fetch("SELECT supply_id, amount FROM contributions WHERE user_id = $1", user_id)
         contrib_dict = {row['supply_id']: row['amount'] for row in contrib_rows}
     finally:
-        await conn.close()
+        if conn:
+            await conn.close()
 
     if not all_supplies:
         await call.answer("Нет поставок.", show_alert=True)
@@ -758,6 +750,7 @@ async def my_contributions(call: CallbackQuery):
     buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")])
 
     await call.message.answer("📦 Ваши поставки:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
 # === 2. Посмотреть поставку ===
 @dp.callback_query(F.data == "view_supply")
 async def view_supply(call: CallbackQuery):
@@ -777,11 +770,11 @@ async def user_show_supply_details(call: CallbackQuery):
     supply_name = None
     supply_status = None
     user_amount = 0
-    total_profit = 0
     expected_earnings = 0
     share = 0
     bank = "Не указаны"
     payment_info = "Не указаны"
+    supply_info_text = ""
 
     try:
         supply_row = await conn.fetchrow("SELECT name, status FROM supplies WHERE id = $1", supply_id)
@@ -793,13 +786,11 @@ async def user_show_supply_details(call: CallbackQuery):
         contrib_row = await conn.fetchrow("SELECT amount FROM contributions WHERE user_id = $1 AND supply_id = $2", user_id, supply_id)
         user_amount = contrib_row['amount'] if contrib_row else 0
 
-        items = await conn.fetch("SELECT price, sell_price FROM items WHERE supply_id = $1", supply_id)
+        items = await conn.fetch("SELECT price, sell_price, is_sold FROM items WHERE supply_id = $1", supply_id)
 
         if items:
             total_cost = sum(item['price'] for item in items)
-            total_revenue = sum(item['sell_price'] for item in items)
-            total_profit = total_revenue - total_cost
-
+            total_revenue = sum(item['sell_price'] for item in items if item['is_sold'])
             total_contrib = await conn.fetchval("SELECT COALESCE(SUM(amount), 0) FROM contributions WHERE supply_id = $1", supply_id)
 
             if total_contrib > 0:
@@ -808,24 +799,36 @@ async def user_show_supply_details(call: CallbackQuery):
                 share = 0
 
             if user_id in ADMIN_IDS:
-                other_share = 1 - share
-                bonus = 0.2 * other_share
-                share = min(share + bonus, 1)
+                other_contrib_sum = sum(c['amount'] for c in await conn.fetch("SELECT amount FROM contributions WHERE supply_id = $1 AND user_id != ANY($2)", supply_id, ADMIN_IDS))
+                if total_contrib > 0:
+                    bonus_share = 0.2 * (other_contrib_sum / total_contrib)
+                    share = min(share + bonus_share, 1)
+            else:
+                admin_contribs_sum = sum(c['amount'] for c in await conn.fetch("SELECT amount FROM contributions WHERE supply_id = $1 AND user_id = ANY($2)", supply_id, ADMIN_IDS))
+                if total_contrib > 0 and admin_contribs_sum > 0:
+                    deduction_share = 0.2 * (user_amount / total_contrib)
+                    share = max(share - deduction_share, 0)
 
-            expected_earnings = round(total_profit * share, 2)
+
+            expected_revenue_for_user = (total_revenue - total_cost) * share
+            expected_earnings = round(expected_revenue_for_user, 2)
+            supply_info_text = f"💰 Предполагаемый заработок: <b>{expected_earnings}₽</b>\n"
+        else:
+            supply_info_text = "📦 В этой поставке пока нет товаров.\n"
 
         req_row = await conn.fetchrow("SELECT bank, payment_info FROM contribution_requests WHERE user_id = $1 AND status = 'pending' ORDER BY id DESC LIMIT 1", user_id)
         bank = req_row['bank'] if req_row else "Не указаны"
         payment_info = req_row['payment_info'] if req_row else "Не указаны"
 
     finally:
-        await conn.close()
+        if conn:
+            await conn.close()
 
     text = (
         f"📦 <b>{supply_name}</b>\n\n"
         f"🚚 Приедет: <b>20–30 дней</b>\n"
         f"⏱ Продажа: <b>зависит от цены</b>\n"
-        f"💰 Предполагаемый заработок: <b>{expected_earnings}₽</b>\n"
+        f"{supply_info_text}"
         f"💸 Ваш вклад: <b>{user_amount}₽</b>\n"
         f"📊 Ваша доля: <b>{share*100:.1f}%</b>\n\n"
         f"🏦 Банк: <b>{bank}</b>\n"
@@ -851,7 +854,8 @@ async def show_supply_list(call: CallbackQuery):
         else:
             supplies = await conn.fetch("SELECT id, name FROM supplies WHERE status = 'completed'")
     finally:
-        await conn.close()
+        if conn:
+            await conn.close()
 
     buttons = []
     for s in supplies:
@@ -870,7 +874,8 @@ async def admin_view_supply(call: CallbackQuery):
     try:
         supplies = await conn.fetch("SELECT id, name FROM supplies WHERE status = 'active'")
     finally:
-        await conn.close()
+        if conn:
+            await conn.close()
 
     if not supplies:
         await call.answer("Нет активной поставки.", show_alert=True)
@@ -893,7 +898,8 @@ async def user_show_supply_items(call: CallbackQuery):
     try:
         name_row = await conn.fetchrow("SELECT name FROM supplies WHERE id = $1", supply_id)
     finally:
-        await conn.close()
+        if conn:
+            await conn.close()
 
     if not name_row:
         await call.answer("Поставка не найдена.")
@@ -917,14 +923,15 @@ async def admin_show_supply_items(call: CallbackQuery):
             return
         items = await conn.fetch("SELECT id, title, price, is_sold FROM items WHERE supply_id = $1", supply_id)
     finally:
-        await conn.close()
+        if conn:
+            await conn.close()
 
     buttons = []
     for item in items:
         item_id, title, price, is_sold = item['id'], item['title'], item['price'], item['is_sold']
         status = "✅" if is_sold else "🔄"
         text = f"{title} — {price}₽ {status}"
-        buttons.append([InlineKeyboardButton(text=text, callback_data=f"admin_item_{item_id}")]) # Changed callback to admin_item_
+        buttons.append([InlineKeyboardButton(text=text, callback_data=f"admin_item_{item_id}")])
 
     buttons.append([InlineKeyboardButton(text="🗑 Удалить все товары", callback_data=f"delete_all_{supply_id}")])
     buttons.append([InlineKeyboardButton(text="🔁 Изменить статус всех", callback_data=f"bulk_status_{supply_id}")])
@@ -948,11 +955,12 @@ async def delete_all_items(call: CallbackQuery):
     try:
         await conn.execute("DELETE FROM items WHERE supply_id = $1", supply_id)
     finally:
-        await conn.close()
+        if conn:
+            await conn.close()
     await call.message.edit_text("🗑 Все товары удалены.")
     await admin_view_supply(call)
 
-STATUSES = ["Куплен", "В пути", "На складе", "Отправлен", "Продан"] # Define STATUSES for bulk_status_prompt
+STATUSES = ["Куплен", "В пути", "На складе", "Отправлен", "Продан"]
 
 @dp.callback_query(F.data.startswith("bulk_status_"))
 async def bulk_status_prompt(call: CallbackQuery, state: FSMContext):
@@ -960,7 +968,7 @@ async def bulk_status_prompt(call: CallbackQuery, state: FSMContext):
     await state.update_data(bulk_supply_id=supply_id)
     buttons = []
     for status in STATUSES:
-        buttons.append([InlineKeyboardButton(text=status, callback_data=f"apply_bulk_status_{status.replace(' ', '_')}")]) # Replace spaces for callback data
+        buttons.append([InlineKeyboardButton(text=status, callback_data=f"apply_bulk_status_{status.replace(' ', '_')}")])
     buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="admin_view_supply")])
     markup = InlineKeyboardMarkup(inline_keyboard=buttons)
     await call.message.edit_text("Выберите статус для **всех товаров** в поставке:", reply_markup=markup, parse_mode="Markdown")
@@ -974,7 +982,8 @@ async def apply_bulk_status(call: CallbackQuery, state: FSMContext):
     try:
         await conn.execute("UPDATE items SET status = $1 WHERE supply_id = $2", status, supply_id)
     finally:
-        await conn.close()
+        if conn:
+            await conn.close()
     await call.answer(f"✅ Статус всех товаров изменён на: {status}")
     await admin_view_supply(call)
 
@@ -989,13 +998,13 @@ async def admin_add_contribution_start(call: CallbackQuery, state: FSMContext):
     try:
         supplies = await conn.fetch("SELECT id, name FROM supplies WHERE status = 'active'")
     finally:
-        await conn.close()
+        if conn:
+            await conn.close()
 
     if not supplies:
         await call.answer("Нет активных поставок. Сначала создайте новую поставку.")
         return
 
-    # If only one active supply, proceed directly, else let admin choose
     if len(supplies) == 1:
         await state.update_data(supply_id=supplies[0]['id'])
         await state.set_state(AddContribution.waiting_username)
@@ -1025,7 +1034,8 @@ async def show_supply_items(call: CallbackQuery):
     try:
         name_row = await conn.fetchrow("SELECT name FROM supplies WHERE id = $1", supply_id)
     finally:
-        await conn.close()
+        if conn:
+            await conn.close()
 
     if not name_row:
         await call.answer("Поставка не найдена.")
@@ -1036,30 +1046,20 @@ async def show_supply_items(call: CallbackQuery):
         reply_markup=await get_item_list_keyboard(supply_id, for_admin=is_admin)
     )
 
-# The original code had a duplicate `show_supply_items` function. I'm keeping only one,
-# the one that was more complete, and adjusting the callback_data handling.
-
-# New handlers for adding/editing items (placeholder for now, as they were not fully provided in original)
-# This requires knowing the FSM states and corresponding message handlers.
-# I'll add the general structure based on existing FSMs for AddItem, EditItem.
-
-# Handler for "toggle_sold"
 @dp.callback_query(F.data.startswith("toggle_sold_"))
-async def toggle_item_sold_status(call: CallbackQuery):
+async def toggle_item_sold_status(call: CallbackQuery, state: FSMContext):
     item_id = int(call.data.split("_")[2])
     conn = await get_db_conn()
     try:
-        # Get current status
         current_status = await conn.fetchval("SELECT is_sold FROM items WHERE id = $1", item_id)
         new_status = not current_status
         await conn.execute("UPDATE items SET is_sold = $1 WHERE id = $2", new_status, item_id)
     finally:
-        await conn.close()
+        if conn:
+            await conn.close()
     await call.answer("Статус товара изменён.")
-    # Refresh item details view
-    await admin_show_item_details(call, dp.fsm.storage) # Pass storage to reuse state
+    await admin_show_item_details(call, state)
 
-# Handler for "admin_delete_item" (requires item_id from state)
 @dp.callback_query(F.data == "admin_delete_item")
 async def admin_delete_item(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
@@ -1072,12 +1072,12 @@ async def admin_delete_item(call: CallbackQuery, state: FSMContext):
     try:
         await conn.execute("DELETE FROM items WHERE id = $1", item_id)
     finally:
-        await conn.close()
+        if conn:
+            await conn.close()
     await call.answer("Товар удалён.")
     await state.clear()
-    await admin_panel(call) # Return to admin panel
+    await admin_panel(call)
 
-# Handler for "admin_edit_item" (starts FSM)
 @dp.callback_query(F.data == "admin_edit_item")
 async def admin_edit_item_start(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
@@ -1091,7 +1091,8 @@ async def admin_edit_item_start(call: CallbackQuery, state: FSMContext):
     try:
         item_data = await conn.fetchrow("SELECT title, price, sell_price, description, photo FROM items WHERE id = $1", item_id)
     finally:
-        await conn.close()
+        if conn:
+            await conn.close()
 
     if not item_data:
         await call.answer("Ошибка: товар не найден.")
@@ -1157,7 +1158,7 @@ async def process_new_item_photo(message: Message, state: FSMContext):
 
 @dp.callback_query(EditItem.waiting_new_photo, F.data == "skip_photo_edit")
 async def skip_item_photo_edit(call: CallbackQuery, state: FSMContext):
-    await state.update_data(new_photo=None) # Keep existing photo
+    await state.update_data(new_photo=None)
     await save_edited_item(call.message, state)
 
 
@@ -1168,7 +1169,7 @@ async def save_edited_item(message: Message, state: FSMContext):
     new_price = data['new_price']
     new_sell_price = data['new_sell_price']
     new_description = data['new_description']
-    new_photo = data.get('new_photo') # This will be None if skipped, or path if new photo uploaded
+    new_photo = data.get('new_photo')
 
     conn = await get_db_conn()
     try:
@@ -1177,19 +1178,19 @@ async def save_edited_item(message: Message, state: FSMContext):
                 "UPDATE items SET title = $1, price = $2, sell_price = $3, description = $4, photo = $5 WHERE id = $6",
                 new_title, new_price, new_sell_price, new_description, new_photo, item_id
             )
-        else: # Keep existing photo
+        else:
             await conn.execute(
                 "UPDATE items SET title = $1, price = $2, sell_price = $3, description = $4 WHERE id = $5",
                 new_title, new_price, new_sell_price, new_description, item_id
             )
     finally:
-        await conn.close()
+        if conn:
+            await conn.close()
 
     await message.answer("✅ Товар успешно изменён!")
     await state.clear()
     await message.answer("Выберите действие:", reply_markup=get_main_menu(message.from_user.id))
 
-# Handler for "admin_add_item" (starts FSM)
 @dp.callback_query(F.data == "admin_add_item")
 async def admin_add_item_start(call: CallbackQuery, state: FSMContext):
     if call.from_user.id not in ADMIN_IDS:
@@ -1201,13 +1202,13 @@ async def admin_add_item_start(call: CallbackQuery, state: FSMContext):
     try:
         supplies = await conn.fetch("SELECT id, name FROM supplies WHERE status = 'active'")
     finally:
-        await conn.close()
+        if conn:
+            await conn.close()
 
     if not supplies:
         await call.answer("Нет активных поставок. Сначала создайте новую поставку.")
         return
 
-    # If only one active supply, proceed directly, else let admin choose
     if len(supplies) == 1:
         await state.update_data(supply_id=supplies[0]['id'])
         await state.set_state(AddItem.waiting_title)
@@ -1270,7 +1271,7 @@ async def add_item_photo(message: Message, state: FSMContext):
     await state.update_data(photo=filename)
 
     data = await state.get_data()
-    supply_id = data.get("supply_id") # Get supply_id from FSM
+    supply_id = data.get("supply_id")
 
     if not supply_id:
         await message.answer("❌ Ошибка: не выбрана поставка.")
@@ -1284,19 +1285,18 @@ async def add_item_photo(message: Message, state: FSMContext):
             supply_id, data['title'], data['price'], data['sell_price'], data['description'], filename
         )
     finally:
-        await conn.close()
+        if conn:
+            await conn.close()
 
     await message.answer("✅ Товар успешно добавлен!")
     await state.clear()
     await message.answer("Выберите действие:", reply_markup=get_main_menu(message.from_user.id))
 
-# === Кнопка "Назад" в главное меню ===
 @dp.callback_query(F.data == "back_to_main")
 async def back_to_main(call: CallbackQuery, state: FSMContext):
     await state.clear()
     await call.message.edit_text("Выберите действие:", reply_markup=get_main_menu(call.from_user.id))
 
-# === Админская панель ===
 @dp.callback_query(F.data == "admin_panel")
 async def admin_panel(call: CallbackQuery):
     if call.from_user.id not in ADMIN_IDS:
@@ -1304,7 +1304,6 @@ async def admin_panel(call: CallbackQuery):
         return
     await call.message.edit_text("⚙️ Админская панель:", reply_markup=get_admin_panel())
 
-# === Make Contribution (User) ===
 @dp.callback_query(F.data == "make_contribution")
 async def make_contribution_start(call: CallbackQuery, state: FSMContext):
     await state.set_state(MakeContribution.waiting_bank)
@@ -1342,7 +1341,6 @@ async def process_user_payment_info(message: Message, state: FSMContext):
     )
     await state.set_state(MakeContribution.waiting_confirm)
 
-
 @dp.callback_query(MakeContribution.waiting_confirm, F.data == "confirm_contribution_details")
 async def confirm_user_contribution(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
@@ -1353,7 +1351,6 @@ async def confirm_user_contribution(call: CallbackQuery, state: FSMContext):
 
     conn = await get_db_conn()
     try:
-        # Check if an existing request needs to be updated or new one inserted
         existing_req = await conn.fetchrow(
             "SELECT id FROM contribution_requests WHERE user_id = $1 AND status = 'pending'",
             user_id
@@ -1369,13 +1366,13 @@ async def confirm_user_contribution(call: CallbackQuery, state: FSMContext):
                 user_id, username, bank, payment_info
             )
     finally:
-        await conn.close()
+        if conn:
+            await conn.close()
 
     await state.clear()
     await call.answer("✅ Ваши реквизиты сохранены. Теперь вы можете сделать вклад.", show_alert=True)
     await call.message.edit_text(PAYMENT_DETAILS + "\n\nСообщите админу о своём вкладе, чтобы он был подтверждён.", parse_mode="HTML")
     await call.message.answer("Выберите действие:", reply_markup=get_main_menu(user_id))
-
 
 @dp.callback_query(MakeContribution.waiting_confirm, F.data == "cancel_contribution")
 async def cancel_user_contribution(call: CallbackQuery, state: FSMContext):
@@ -1383,13 +1380,10 @@ async def cancel_user_contribution(call: CallbackQuery, state: FSMContext):
     await call.answer("❌ Ввод реквизитов отменён.", show_alert=True)
     await call.message.edit_text("Выберите действие:", reply_markup=get_main_menu(call.from_user.id))
 
-# User starts editing their contribution details (used from user_show_supply_details)
 @dp.callback_query(F.data == "user_start_contribution")
 async def user_start_contribution_edit(call: CallbackQuery, state: FSMContext):
     await make_contribution_start(call, state)
 
-
-# New handlers for admin_view_contributions
 @dp.callback_query(F.data == "admin_view_contributions")
 async def admin_view_contributions(call: CallbackQuery):
     if call.from_user.id not in ADMIN_IDS:
@@ -1406,7 +1400,8 @@ async def admin_view_contributions(call: CallbackQuery):
             ORDER BY supply_name, c.amount DESC
         """)
     finally:
-        await conn.close()
+        if conn:
+            await conn.close()
 
     if not contributions:
         await call.answer("Вкладов пока нет.", show_alert=True)
@@ -1426,7 +1421,6 @@ async def admin_view_contributions(call: CallbackQuery):
 
     await call.message.answer(text, reply_markup=markup, parse_mode="HTML")
 
-
 @dp.callback_query(F.data.startswith("reject_req_"))
 async def reject_contribution_request(call: CallbackQuery):
     req_id = int(call.data.split("_")[2])
@@ -1438,11 +1432,11 @@ async def reject_contribution_request(call: CallbackQuery):
             await call.answer("Заявка не найдена.")
             return
         user_id = row['user_id']
-        username = row['username']
 
         await conn.execute("UPDATE contribution_requests SET status = 'rejected' WHERE id = $1", req_id)
     finally:
-        await conn.close()
+        if conn:
+            await conn.close()
 
     try:
         await bot.send_message(user_id, f"❌ Ваша заявка на вклад была отклонена.")
@@ -1450,11 +1444,10 @@ async def reject_contribution_request(call: CallbackQuery):
         print(f"Failed to notify user {user_id} about rejected request: {e}")
 
     await call.answer("Заявка отклонена.")
-    await admin_view_requests(call) # Refresh the list of pending requests
+    await admin_view_requests(call)
 
-# Main function to run the bot
 async def main():
-    await init_db() # Initialize database before starting bot
+    await init_db()
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
